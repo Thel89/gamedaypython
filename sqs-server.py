@@ -43,10 +43,11 @@ def server():
             msg_id = body['Id']
             part_number = body['PartNumber']
             data = body['Data']
+            expected_count = msg['TotalParts']
             # process message
             logging.info("Body: {}".format(body))
             # put the part received into dynamo
-            proceed = store_message(msg_id, part_number, data)
+            proceed = store_message(msg_id, part_number, data, expected_count)
             # delete message from queue
             message.delete()
             # keep processing
@@ -57,7 +58,7 @@ def server():
             # try to get the parts of the message from the Dynamo.
             check_messages(msg_id)
 
-def store_message(msg_id, part_number, data):
+def store_message(msg_id, part_number, data, expected_count):
     """
     stores the message locally on a file on disk for persistence
     """
@@ -66,7 +67,8 @@ def store_message(msg_id, part_number, data):
             Item={
                 'msg_id': msg_id,
                 'part_number': part_number,
-                'data': data
+                'data': data,
+                'expected_count': expected_count
             },
             ConditionExpression='attribute_not_exists(msg_id)')
         return True
@@ -83,11 +85,13 @@ def check_messages(msg_id):
     # do a get item from dynamo to see if item exists
     db_messages = table.query(KeyConditionExpression=Key('msg_id').eq(msg_id))
     # check if both parts exist
-    if db_messages["Count"] == 2:
+    if db_messages["Count"] == db_messages["Items"][0]['expected_count'] and db_messages["Items"][0]['part_number'] != '-1':
         # app.logger.debug("got a complete message for %s" % msg_id)
         logging.info("Have both parts for msg_id={}".format(msg_id))
         # We can build the final message.
-        result = db_messages["Items"][0]["data"] + db_messages["Items"][1]["data"]
+        result = ''
+        for part in db_messages["Items"]:
+            result += part['data']
         logging.debug("Assembled message: {}".format(result))
         # sending the response to the score calculator
         # format:
@@ -100,6 +104,7 @@ def check_messages(msg_id):
         resp = urllib2.urlopen(req)
         logging.debug("Response from server: {}".format(resp.read()))
         resp.close()
+        store_message(msg_id, '-1', 'message sent', expected_count)
 
 if __name__ == "__main__":
     server()

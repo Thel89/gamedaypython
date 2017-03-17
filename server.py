@@ -49,6 +49,9 @@ def get_message_stats():
     estimated_count = table.item_count
     return "There are ~{} messages in the DynamoDB table".format(estimated_count)
 
+def getPartNum(part):
+    return int(part["part_number"])
+
 def process_message(msg):
     """
     processes the messages by combining parts
@@ -56,6 +59,7 @@ def process_message(msg):
     msg_id = msg['Id'] # The unique ID for this message
     part_number = msg['PartNumber'] # Which part of the message it is
     data = msg['Data'] # The data of the message
+    expected_count = msg['TotalParts']
 
     # log
     logging.info("Processing message for msg_id={} with part_number={} and data={}".format(msg_id, part_number, data))
@@ -65,19 +69,23 @@ def process_message(msg):
         Item={
             'msg_id': msg_id,
             'part_number': part_number,
-            'data': data
+            'data': data,
+            'expected_count': expected_count
         },
         ConditionExpression='attribute_not_exists(msg_id)')
 
     # try to get the parts of the message from the dynamodb table
     db_messages = table.query(KeyConditionExpression=Key('msg_id').eq(msg_id))
+    parts = sorted(db_messages["Items"], key=getPartNum)
 
-    # if we have both parts, the message is complete
-    if db_messages["Count"] == 2:
+    # if we have all parts, the message is complete
+    if db_messages["Count"] == parts[0]["expected_count"] and parts[0]["part_number"] != "-1":
         # app.logger.debug("got a complete message for %s" % msg_id)
-        logging.info("Have both parts for msg_id={}".format(msg_id))
+        logging.info("Have all parts for msg_id={}".format(msg_id))
         # We can build the final message.
-        result = db_messages["Items"][0]["data"] + db_messages["Items"][1]["data"]
+        result = ''
+        for part in parts:
+            result += part['data']
         logging.debug("Assembled message: {}".format(result))
         # sending the response to the score calculator
         # format:
@@ -90,6 +98,14 @@ def process_message(msg):
         resp = urllib2.urlopen(req)
         logging.debug("Response from server: {}".format(resp.read()))
         resp.close()
+        table.put_item(
+            Item={
+                'msg_id': msg_id,
+                'part_number': '-1',
+                'data': "sent",
+                'expected_count': expected_count
+            },
+            ConditionExpression='attribute_not_exists(msg_id)')
 
     return 'OK'
 
