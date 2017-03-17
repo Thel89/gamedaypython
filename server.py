@@ -1,13 +1,11 @@
-#!/usr/bin/env python
-"""
-Client which receives and processes the requests
-"""
+from __future__ import print_function
+
 import os
 import logging
-import argparse
+import json
 import urllib2
 import boto3
-from flask import Flask, request
+
 from boto3.dynamodb.conditions import Key
 
 # configure logging
@@ -23,56 +21,68 @@ if API_BASE is None:
 DYNAMO_TABLE = os.getenv("GD_DYNAMO_TABLE")
 if DYNAMO_TABLE is None:
     raise Exception("Must define GD_DYNAMO_TABLE environment variable")
-
-app = Flask(__name__)
+SQS_QUEUE = os.getenv("GD_SQS_QUEUE")
+if SQS_QUEUE is None:
+    raise Exception("Must define SQS_QUEUE environment variable")
 
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(DYNAMO_TABLE)
 
-# creating flask route for type argument
-@app.route('/', methods=['GET', 'POST'])
-def main_handler():
-    """
-    main routing for requests
-    """
-    if request.method == 'POST':
-        return process_message(request.get_json())
-    else:
-        return get_message_stats()
+SQS = boto3.resource('sqs')
+QUEUE = SQS.get_queue_by_name(QueueName=SQS_QUEUE)
 
-def get_message_stats():
-    """
-    provides a status that players can check
-    """
-    # use DescribeTable to get number of items in DynamoDB table rather than
-    # Scan as a Scan is very expensive and wille exhaust read capacity
-    estimated_count = table.item_count
-    return "There are ~{} messages in the DynamoDB table".format(estimated_count)
 
-def process_message(msg):
+def server():
+    while True:
+        logging.info("Getting messages from queue...")
+        # get messages from queue
+        messages = QUEUE.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=20)
+        for message in messages:
+            # parse message
+            body = json.loads(message.body)
+            msg_id = body['Id']
+            part_number = body['PartNumber']
+            data = body['Data']
+            # process message
+            logging.info("Body: {}".format(body))
+            # put the part received into dynamo
+            proceed = store_message(msg_id, part_number, data)
+            # delete message from queue
+            message.delete()
+            # keep processing
+            if proceed is False:
+                # we have already processed this message so don't proceed
+                logging.info("skipping duplicate message")
+                continue
+            # try to get the parts of the message from the Dynamo.
+            check_messages(msg_id)
+
+def store_message(msg_id, part_number, data):
     """
-    processes the messages by combining parts
+    stores the message locally on a file on disk for persistence
     """
-    msg_id = msg['Id'] # The unique ID for this message
-    part_number = msg['PartNumber'] # Which part of the message it is
-    data = msg['Data'] # The data of the message
+    try:
+        table.put_item(
+            Item={
+                'msg_id': msg_id,
+                'part_number': part_number,
+                'data': data
+            },
+            ConditionExpression='attribute_not_exists(msg_id)')
+        return True
+    except Exception:
+        # conditional update failed since we have already processed this message
+        # at this point we can bail since we don't want to process again
+        # and lose cash moneys
+        return False
 
-    # log
-    logging.info("Processing message for msg_id={} with part_number={} and data={}".format(msg_id, part_number, data))
-
-    # store this part of the message in the dynamodb table
-    table.put_item(
-        Item={
-            'msg_id': msg_id,
-            'part_number': part_number,
-            'data': data
-        },
-        ConditionExpression='attribute_not_exists(msg_id)')
-
-    # try to get the parts of the message from the dynamodb table
+def check_messages(msg_id):
+    """
+    checking to see in dynamo if we have the part already
+    """
+    # do a get item from dynamo to see if item exists
     db_messages = table.query(KeyConditionExpression=Key('msg_id').eq(msg_id))
-
-    # if we have both parts, the message is complete
+    # check if both parts exist
     if db_messages["Count"] == 2:
         # app.logger.debug("got a complete message for %s" % msg_id)
         logging.info("Have both parts for msg_id={}".format(msg_id))
@@ -91,8 +101,5 @@ def process_message(msg):
         logging.debug("Response from server: {}".format(resp.read()))
         resp.close()
 
-    return 'OK'
-
 if __name__ == "__main__":
-    # By default, we disable threading for "debugging" purposes.
-    app.run(host="0.0.0.0", port="5000", threaded=False)
+    server()
