@@ -61,13 +61,20 @@ def process_message(msg):
     logging.info("Processing message for msg_id={} with part_number={} and data={}".format(msg_id, part_number, data))
 
     # store this part of the message in the dynamodb table
-    table.put_item(
-        Item={
-            'msg_id': msg_id,
-            'part_number': part_number,
-            'data': data
-        },
-        ConditionExpression='attribute_not_exists(msg_id)')
+    try:
+        table.put_item(
+            Item={
+                'msg_id': msg_id,
+                'part_number': part_number,
+                'data': data
+            },
+            ConditionExpression='attribute_not_exists(msg_id)')
+    except Exception:
+        # conditional update failed since we have already processed this message
+        # at this point we can bail since we don't want to process again
+        # and lose cash moneys
+        return 'OK'
+
 
     # try to get the parts of the message from the dynamodb table
     db_messages = table.query(KeyConditionExpression=Key('msg_id').eq(msg_id))
